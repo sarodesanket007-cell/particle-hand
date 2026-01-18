@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand-Controlled 3D Particle System</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        canvas { display: block; }
+        #video-container {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            width: 160px;
+            height: 120px;
+            border: 2px solid #333;
+            z-index: 10;
+            opacity: 0.7;
+            transform: scaleX(-1); /* Mirror video */
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #00ffcc;
+            pointer-events: none;
+            z-index: 100;
+        }
+        h1 { font-size: 1.5rem; margin: 0 0 10px 0; text-shadow: 0 0 10px #00ffcc; }
+        p { font-size: 0.9rem; margin: 5px 0; color: #fff; }
+        .highlight { color: #ff00ff; font-weight: bold; }
+        #loading {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 1.5rem;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <h1>Quantum Particle Hand</h1>
+        <p>Current Shape: <span id="shape-name" class="highlight">Sphere</span></p>
+        <p>🖐 <b>Move Hand</b> to position particles</p>
+        <p>👌 <b>Pinch (Index+Thumb)</b> to change shape</p>
+        <p>✊ <b>Fist</b> to condense / ✋ <b>Open</b> to expand</p>
+    </div>
+
+    <div id="loading">Initializing Camera & AI...<br><small>Please allow camera access</small></div>
+
+    <video id="input_video" style="display:none"></video>
+    <canvas id="output_canvas" id="video-container"></canvas>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <script>
+        // --- CONFIGURATION ---
+        const PARTICLE_COUNT = 3000;
+        const PARTICLE_SIZE = 0.08;
+        const INTERACTION_SMOOTHING = 0.1;
+        
+        let scene, camera, renderer, points;
+        let positions, colors, sizes; 
+        let currentShapePositions = []; 
+        let targetShapePositions = [];
+        
+        // State
+        let handPosition = new THREE.Vector3(0, 0, 0);
+        let handOpenness = 1.0; // 0 (fist) to 1 (open)
+        let currentShapeIndex = 0;
+        let lastPinchTime = 0;
+        
+        const shapes = ['Sphere', 'Heart', 'Saturn', 'Flower', 'Torus Knot'];
+
+        // --- INIT THREE.JS ---
+        function initThree() {
+            scene = new THREE.Scene();
+            // Add subtle fog for depth
+            scene.fog = new THREE.FogExp2(0x000000, 0.02);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.z = 5;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            createParticles();
+            
+            window.addEventListener('resize', onWindowResize, false);
+            animate();
+        }
+
+        function createParticles() {
+            const geometry = new THREE.BufferGeometry();
+            positions = new Float32Array(PARTICLE_COUNT * 3);
+            colors = new Float32Array(PARTICLE_COUNT * 3);
+            
+            // Initialize arrays
+            currentShapePositions = new Float32Array(PARTICLE_COUNT * 3);
+            targetShapePositions = new Float32Array(PARTICLE_COUNT * 3);
+
+            const color = new THREE.Color();
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                // Initial random positions
+                positions[i * 3] = (Math.random() - 0.5) * 10;
+                positions[i * 3 + 1] = (Math.random() - 0.5) * 10;
+                positions[i * 3 + 2] = (Math.random() - 0.5) * 10;
+
+                // Initial colors (Cyan/Blue theme)
+                color.setHSL(0.5 + Math.random() * 0.2, 0.8, 0.5);
+                colors[i * 3] = color.r;
+                colors[i * 3 + 1] = color.g;
+                colors[i * 3 + 2] = color.b;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            // Shader Material for nice glowing particles
+            const textureLoader = new THREE.TextureLoader();
+            // Creating a simple circular glow texture programmatically to avoid external assets issues
+            const canvas = document.createElement('canvas');
+            canvas.width = 32; canvas.height = 32;
+            const context = canvas.getContext('2d');
+            const gradient = context.createRadialGradient(16, 16, 0, 16, 16, 16);
+            gradient.addColorStop(0, 'rgba(255,255,255,1)');
+            gradient.addColorStop(0.2, 'rgba(255,255,255,0.8)');
+            gradient.addColorStop(0.5, 'rgba(255,255,255,0.2)');
+            gradient.addColorStop(1, 'rgba(0,0,0,0)');
+            context.fillStyle = gradient;
+            context.fillRect(0,0,32,32);
+            const texture = new THREE.CanvasTexture(canvas);
+
+            const material = new THREE.PointsMaterial({
+                size: PARTICLE_SIZE,
+                map: texture,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                transparent: true,
+                opacity: 0.8
+            });
+
+            points = new THREE.Points(geometry, material);
+            scene.add(points);
+
+            // Calculate initial target (Sphere)
+            calculateShape('Sphere');
+        }
+
+        // --- MATH FOR SHAPES ---
+        function calculateShape(type) {
+            const arr = targetShapePositions;
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const i3 = i * 3;
+                let x, y, z;
+
+                if (type === 'Sphere') {
+                    const r = 2.5;
+                    const phi = Math.acos( -1 + ( 2 * i ) / PARTICLE_COUNT );
+                    const theta = Math.sqrt( PARTICLE_COUNT * Math.PI ) * phi;
+                    x = r * Math.sin(phi) * Math.cos(theta);
+                    y = r * Math.sin(phi) * Math.sin(theta);
+                    z = r * Math.cos(phi);
+                
+                } else if (type === 'Heart') {
+                    // Parametric Heart
+                    const t = Math.random() * Math.PI * 2;
+                    const u = Math.random() * Math.PI;
+                    // Spread distribution
+                    const scale = 0.15;
+                    x = 16 * Math.pow(Math.sin(t), 3) * scale;
+                    y = (13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t)) * scale;
+                    // Add thickness
+                    z = (Math.random() - 0.5) * 2; 
+
+                } else if (type === 'Saturn') {
+                    const r = Math.random();
+                    // 70% particles in the ring, 30% in the planet
+                    if (r > 0.3) {
+                        // Ring
+                        const angle = Math.random() * Math.PI * 2;
+                        const dist = 3 + Math.random() * 2;
+                        x = Math.cos(angle) * dist;
+                        z = Math.sin(angle) * dist;
+                        y = (Math.random() - 0.5) * 0.2;
+                    } else {
+                        // Planet
+                        const radius = 1.8;
+                        const phi = Math.acos( -1 + ( 2 * Math.random() ) );
+                        const theta = Math.sqrt( PARTICLE_COUNT * Math.PI ) * phi;
+                        x = radius * Math.sin(phi) * Math.cos(theta);
+                        y = radius * Math.sin(phi) * Math.sin(theta);
+                        z = radius * Math.cos(phi);
+                    }
+                    // Tilt Saturn
+                    const tilt = 0.4;
+                    const tempY = y * Math.cos(tilt) - z * Math.sin(tilt);
+                    const tempZ = y * Math.sin(tilt) + z * Math.cos(tilt);
+                    y = tempY; z = tempZ;
+
+                } else if (type === 'Flower') {
+                    const u = Math.random() * Math.PI * 2; 
+                    const v = Math.random() * Math.PI; 
+                    const radius = 2 + Math.sin(5 * u) * Math.sin(5 * v); // 5 petals
+                    x = radius * Math.sin(v) * Math.cos(u);
+                    y = radius * Math.sin(v) * Math.sin(u);
+                    z = radius * Math.cos(v);
+
+                } else if (type === 'Torus Knot') {
+                    const t = (i / PARTICLE_COUNT) * Math.PI * 2 * 10; // 10 loops
+                    const p = 2, q = 3;
+                    const scale = 0.8;
+                    x = scale * (2 + Math.cos(q * t)) * Math.cos(p * t);
+                    y = scale * (2 + Math.cos(q * t)) * Math.sin(p * t);
+                    z = scale * Math.sin(q * t);
+                }
+
+                arr[i3] = x;
+                arr[i3 + 1] = y;
+                arr[i3 + 2] = z;
+            }
+        }
+
+        // --- ANIMATION LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const positionsAttribute = points.geometry.attributes.position;
+            const colorsAttribute = points.geometry.attributes.color;
+            const posArr = positionsAttribute.array;
+            const colArr = colorsAttribute.array;
+
+            // Time for animations
+            const time = Date.now() * 0.001;
+            
+            // Map Hand X position to hue shift
+            const hueShift = (handPosition.x + 3) / 6; // normalize roughly
+            const baseColor = new THREE.Color();
+            
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const i3 = i * 3;
+
+                // 1. Interpolate towards target shape
+                // We use a lerp factor. If hand is closed (0), particles are tight. If open (1), they might scatter slightly.
+                const lerpSpeed = 0.05;
+                
+                // Get target position
+                let tx = targetShapePositions[i3];
+                let ty = targetShapePositions[i3 + 1];
+                let tz
